@@ -143,7 +143,7 @@ void execute(UM UM, SegMem SegMem)
         UM->prog_counter),
                      &UM->prog_counter);
         UM->prog_counter++;
-    }
+    } //hello
 }
 
 /* run_instruct: Parses an instruction for its opcode and then based on 
