@@ -11,11 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include "bitpack.h"
-#include "seq.h"
-#include "assert.h"
+#include <string.h>
+#include "mem.h"
 #include <stdint.h>
-#include "uarray.h"
 
 #define CHAR_SIZE 8
 #define NUM_REG 8
@@ -30,23 +28,25 @@
 #define OP_LEN 4
 #define OP_LSB 28
 
-typedef enum UM_opcode
-{
-    CMOV = 0, SLOAD, SSTORE, ADD, MUL, DIV, NAND, HALT, MAP, UNMAP,
-    OUTPUT, INPUT, LOADP, LOADV
-} UM_opcode;
+typedef struct A {
+    int length;
+    int size;
+    char *array;
+} * A;
+
+typedef struct T {
+	struct A array;
+	int length;
+	int head;
+} * T;
 
 typedef struct UM
 {
     uint32_t prog_counter;
     uint32_t *registers;
+    T seg_mem;
+    T unmapped_segs;
 } * UM;
-
-typedef struct SegMem
-{
-    Seq_T seg_mem;
-    Seq_T unmapped_segs;
-} * SegMem;
 
 typedef struct segment
 {
@@ -54,6 +54,102 @@ typedef struct segment
     uint32_t seg[];
 } * segment;
 
+static inline void Array_resize(A array, int length) {
+	if (length == 0)
+		FREE(array->array);
+	else if (array->length == 0)
+		array->array = ALLOC(length*array->size);
+	else
+		RESIZE(array->array, length*array->size);
+	array->length = length;
+}
+
+static inline void expand(T seq) {
+	int n = seq->array.length;
+	Array_resize(&seq->array, 2*n);
+	if (seq->head > 0)
+		{
+			void **old = &((void **)seq->array.array)[seq->head];
+			memcpy(old+n, old, (n - seq->head)*sizeof (void *));
+			seq->head += n;
+		}
+}
+
+static inline uint64_t Bitpack_newu(uint64_t word, unsigned width, unsigned lsb, 
+                      uint64_t value)
+{
+        uint64_t bit_mask = ~0;
+        bit_mask = bit_mask << (64 -  (width +lsb));
+        bit_mask = bit_mask >> (64 - width);
+        bit_mask = bit_mask << lsb;
+        bit_mask = ~bit_mask;
+        value = value << lsb;
+        word = word & bit_mask;
+        word = word | value;
+        return word;
+}
+
+static inline void ArrayRep_init(A array, int length, int size,
+	void *ary) {
+	array->length = length;
+	array->size   = size;
+	if (length > 0)
+		array->array = ary;
+	else
+		array->array = NULL;
+}
+
+static inline void Array_free(A *array) {
+	FREE((*array)->array);
+	FREE(*array);
+}
+
+static inline T Seq_new(int hint) {
+	T seq;
+	NEW0(seq);
+	if (hint == 0)
+		hint = 16;
+	ArrayRep_init(&seq->array, hint, sizeof (void *),
+		ALLOC(hint*sizeof (void *)));
+	return seq;
+}
+
+static inline void Seq_free(T *seq) {
+	Array_free((A *)seq);
+}
+static inline int Seq_length(T seq) {
+	return seq->length;
+}
+static inline void *Seq_get(T seq, int i) {
+	return ((void **)seq->array.array)[
+	       	(seq->head + i)%seq->array.length];
+}
+static inline void *Seq_put(T seq, int i, void *x) {
+	void *prev;
+	prev = ((void **)seq->array.array)[
+	       	(seq->head + i)%seq->array.length];
+	((void **)seq->array.array)[
+		(seq->head + i)%seq->array.length] = x;
+	return prev;
+}
+
+static inline void *Seq_remlo(T seq) {
+	int i = 0;
+	void *x;
+	x = ((void **)seq->array.array)[
+	    	(seq->head + i)%seq->array.length];
+	seq->head = (seq->head + 1)%seq->array.length;
+	--seq->length;
+	return x;
+}
+static inline void *Seq_addhi(T seq, void *x) {
+	int i;
+	if (seq->length == seq->array.length)
+		expand(seq);
+	i = seq->length++;
+	return ((void **)seq->array.array)[
+	       	(seq->head + i)%seq->array.length] = x;
+}
 
 int main(int argc, char *argv[])
 {
@@ -78,26 +174,24 @@ int main(int argc, char *argv[])
         UM UM = malloc(sizeof(struct UM));
         UM->prog_counter = 0;
         UM->registers = malloc(NUM_REG * sizeof(uint32_t));
-        for (int i = 0; i < NUM_REG; i++)
+        int i;
+        for (i = 0; i < NUM_REG; i++)
             UM->registers[i] = 0;
-        SegMem SegMem = malloc(sizeof(struct SegMem));
-        SegMem->seg_mem = Seq_new(SEQ_HINT);
-        // Seq_addhi(SegMem->seg_mem, create_segment(num_instructs));
+
+        UM->seg_mem = Seq_new(SEQ_HINT);
 
         segment seg_zero = malloc(num_instructs * sizeof(uint32_t)+sizeof(int));
-        for(int i=0; i< num_instructs; i++) {
+        for(i=0; i< num_instructs; i++) {
             seg_zero->seg[i] = 0;
         }
         seg_zero->length = num_instructs;
-        Seq_addhi(SegMem->seg_mem, seg_zero);
+        Seq_addhi(UM->seg_mem, seg_zero);
 
-        SegMem->unmapped_segs = Seq_new(SEQ_HINT);
+        UM->unmapped_segs = Seq_new(SEQ_HINT);
         FILE *input_file = fopen(argv[1], "rb");
-        // UArray_T curr_array = Seq_get(SegMem->seg_mem, SEG_ZERO);
-        // int length = UArray_length(curr_array);
-        // uint32_t *curr_elem;
+
         uint32_t instruction;
-        for (int i = 0; i < num_instructs; i++) {
+        for (i = 0; i < num_instructs; i++) {
             instruction = 0;
             instruction = (uint32_t)Bitpack_newu(instruction, CHAR_SIZE, 24,
                                                 fgetc(input_file));
@@ -107,16 +201,11 @@ int main(int argc, char *argv[])
                                                 fgetc(input_file));
             instruction = (uint32_t)Bitpack_newu(instruction, CHAR_SIZE, 0,
                                                 fgetc(input_file));
-            // curr_elem = (uint32_t *)UArray_at(curr_array, i);
-            // *curr_elem = instruction;
             seg_zero->seg[i] = instruction;
         }
         fclose(input_file);
-        // UArray_T seg_zero = (UArray_T)Seq_get(SegMem->seg_mem, SEG_ZERO);
-        while (true) 
+        while (1) 
         {
-            // run_instruct(UM, SegMem, seg_zerooo[UM->prog_counter],
-            // seg_zerooo, &UM->prog_counter);
             uint32_t curr_instruct = seg_zero->seg[UM->prog_counter];
             uint64_t word_0 = curr_instruct;
             word_0 = word_0 << (32);
@@ -148,18 +237,12 @@ int main(int argc, char *argv[])
                             if (*regC != 0)
                                 *regA = *regB;
                         } else {
-                            // UArray_T curr_seg = Seq_get(SegMem->seg_mem, *regB);
-                            segment curr_seg = Seq_get(SegMem->seg_mem, *regB);
+                            segment curr_seg = Seq_get(UM->seg_mem, *regB);
                             *regA = curr_seg->seg[*regC];
-                            // *regA = *((uint32_t *)UArray_at(curr_seg, *regC));
-                        }
+                        } 
                     } else {
                         if (opcode == 2) {
-                            // uint32_t *curr_offset;
-                            // UArray_T curr_seg = Seq_get(SegMem->seg_mem, *regA);
-                            segment curr_seg = Seq_get(SegMem->seg_mem, *regA);
-                            // curr_offset = (uint32_t *)UArray_at(curr_seg, *regB);
-                            // *curr_offset = *regC;
+                            segment curr_seg = Seq_get(UM->seg_mem, *regA);
                             curr_seg->seg[*regB] = *regC;
                         } else {
                             *regA = (*regB + *regC);
@@ -182,16 +265,14 @@ int main(int argc, char *argv[])
                         if (opcode == 7) {
                             uint32_t *temp = UM->registers;
                             free((temp));
-                            free(UM);
-                            for (int i = 0; i < Seq_length(SegMem->seg_mem); i++) {
-                                // UArray_T temp = Seq_get(SegMem->seg_mem, i);
-                                segment temp = Seq_get(SegMem->seg_mem, i);
+                            for (i = 0; i < Seq_length(UM->seg_mem); i++) {
+                                segment temp = Seq_get(UM->seg_mem, i);
                                 if (temp != NULL)
                                     free(temp);
                             }
-                            Seq_free(&(SegMem->unmapped_segs));
-                            Seq_free(&(SegMem->seg_mem));
-                            free(SegMem);
+                            Seq_free(&(UM->unmapped_segs));
+                            Seq_free(&(UM->seg_mem));
+                            free(UM);
                             exit(EXIT_SUCCESS);
                         } else { //8
                             uint64_t word_2 = curr_instruct;
@@ -204,29 +285,19 @@ int main(int argc, char *argv[])
                             C = (uint32_t) word_3;
                             regB = &((UM->registers)[B]);
                             regC = &((UM->registers)[C]);
-                            // UArray_T segment = UArray_new(*regC, sizeof(uint32_t));
                             segment segment = malloc(*regC * sizeof(uint32_t) + sizeof(int));
-                            for(int i=0; i < (int)*regC; i++) {
+                            for(i=0; i < (int)*regC; i++) {
                                 segment->seg[i] = 0;
                             }
                             segment->length = *regC;
-                            // uint32_t *curr_elem;
-                            // for (int i = 0; i < (int)*regC; i++)
-                            // {
-                            //     curr_elem = (uint32_t *)UArray_at(segment, i);
-                            //     *curr_elem = 0;
-                            // }
-                            // UArray_T mapped_seg = segment;
-                            if (Seq_length(SegMem->unmapped_segs) > 0) {
+                            if (Seq_length(UM->unmapped_segs) > 0) {
                                 uint32_t location = (uint32_t)(uintptr_t)
-                                    Seq_remlo(SegMem->unmapped_segs);
-                                // Seq_put(SegMem->seg_mem, location, mapped_seg);
-                                Seq_put(SegMem->seg_mem, location, segment);
+                                Seq_remlo(UM->unmapped_segs);
+                                Seq_put(UM->seg_mem, location, segment);
                                 *regB = location;
                             } else {
-                                // Seq_addhi(SegMem->seg_mem, mapped_seg);
-                                Seq_addhi(SegMem->seg_mem, segment);
-                                *regB = (Seq_length(SegMem->seg_mem) - 1);
+                                Seq_addhi(UM->seg_mem, segment);
+                                *regB = (Seq_length(UM->seg_mem) - 1);
                             }
                         }
                     }
@@ -237,11 +308,10 @@ int main(int argc, char *argv[])
                             word_3 = word_3 >> (61);
                             C = (uint32_t) word_3;
                             regC = &((UM->registers)[C]);
-                            // UArray_T unmap_seg = Seq_get(SegMem->seg_mem, *regC);
-                            segment unmap_seg = Seq_get(SegMem->seg_mem, *regC);
+                            segment unmap_seg = Seq_get(UM->seg_mem, *regC);
                             free(unmap_seg);
-                            Seq_put(SegMem->seg_mem, *regC, NULL);
-                            Seq_addhi(SegMem->unmapped_segs, (void *)(uintptr_t)*regC);
+                            Seq_put(UM->seg_mem, *regC, NULL);
+                            Seq_addhi(UM->unmapped_segs, (void *)(uintptr_t)*regC);
                         } else { //10
                             uint64_t word_3 = curr_instruct;
                             word_3 = word_3 << (61);
@@ -276,27 +346,18 @@ int main(int argc, char *argv[])
                             regB = &((UM->registers)[B]);
                             regC = &((UM->registers)[C]);
                             if (*regB != 0) {
-                                    // uint32_t *curr_elem;
-                                    // uint32_t *new_elem;
-                                    // UArray_T curr_seg = Seq_get(SegMem->seg_mem, *regB);
-                                    segment curr_seg = Seq_get(SegMem->seg_mem, *regB);
-                                    // int length = UArray_length(curr_seg);
-                                    // UArray_T new_seg = UArray_new(length, sizeof(uint32_t));
+                                    segment curr_seg = Seq_get(UM->seg_mem, *regB);
                                     segment new_seg = malloc(curr_seg->length * sizeof(uint32_t) + sizeof(int));
-                                    for(int i=0; i< num_instructs; i++) {
+                                    for(i=0; i< num_instructs; i++) {
                                         new_seg->seg[i] = 0;
                                     }
                                     new_seg->length = curr_seg->length;
-                                    for (int i = 0; i < new_seg->length; i++) {
-                                        // curr_elem = (uint32_t *)UArray_at(curr_seg, i);
-                                        // new_elem = (uint32_t *)UArray_at(new_seg, i);
-                                        // *new_elem = *curr_elem;
+                                    for (i = 0; i < new_seg->length; i++) {
                                         new_seg->seg[i] = curr_seg->seg[i];
                                     }
-                                    // UArray_free(seg_zero);
                                     free(seg_zero);
-                                    Seq_put(SegMem->seg_mem, SEG_ZERO, NULL);
-                                    Seq_put(SegMem->seg_mem, SEG_ZERO, new_seg);
+                                    Seq_put(UM->seg_mem, SEG_ZERO, NULL);
+                                    Seq_put(UM->seg_mem, SEG_ZERO, new_seg);
                                     seg_zero = new_seg;
                             }
                             UM->prog_counter = (*regC - 1);
@@ -320,13 +381,3 @@ int main(int argc, char *argv[])
     }
     return EXIT_SUCCESS;
 }
-
-/* run_instruct: Parses an instruction for its opcode and then based on 
-   the opcode of the instruction, the program possibly parses for registers 
-   and completes one instruction per a call of this function */
-// void run_instruct(UM UM, SegMem SegMem, uint32_t instruction, uint32_t *seg_zero,
-//                   uint32_t *prog_counter)
-// {
-
-// }
-
